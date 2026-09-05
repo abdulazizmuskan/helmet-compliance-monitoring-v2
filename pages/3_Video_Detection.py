@@ -3,67 +3,131 @@ import tempfile
 import cv2
 
 from models.load_model import load_model
+from database.db_operations import insert_detection
+from utils.ui_components import (
+    inject_global_css,
+    render_sidebar_brand,
+    render_sidebar_footer,
+    render_header,
+    render_result_card,
+    section_header,
+    empty_state,
+)
 
-st.title("🎥 Helmet Video Detection")
+st.set_page_config(page_title="Video Detection | Helmet Compliance", layout="wide")
 
-model = load_model()
+inject_global_css()
+render_sidebar_brand()
+render_sidebar_footer(model_ready=True)
+
+render_header(
+    "Video Detection",
+    "Process a video frame-by-frame for helmet compliance",
+)
+
+# Log at most this many frames per video to the database, so a long video
+# doesn't flood the detections table with thousands of near-duplicate rows.
+LOG_EVERY_N_FRAMES = 15
+
+section_header("📤", "Upload Video")
 
 video_file = st.file_uploader(
     "Upload a Video",
-    type=["mp4", "avi", "mov"]
+    type=["mp4", "avi", "mov"],
+    label_visibility="collapsed",
 )
 
-if video_file:
+if not video_file:
+    empty_state("🎥", "Upload a video to begin analysis.")
+else:
+    try:
+        model = load_model()
+    except Exception:
+        st.error("Unable to process the uploaded file.")
+        st.stop()
 
     temp_file = tempfile.NamedTemporaryFile(delete=False)
-
     temp_file.write(video_file.read())
 
     cap = cv2.VideoCapture(temp_file.name)
 
-    frame_placeholder = st.empty()
+    if not cap.isOpened():
+        st.error("Unable to process the uploaded file.")
+        st.stop()
 
-    prediction_placeholder = st.empty()
+    section_header("🔍", "Live Processing")
 
-    while cap.isOpened():
+    col1, col2 = st.columns([2, 1])
 
-        ret, frame = cap.read()
+    with col1:
+        frame_placeholder = st.empty()
+    with col2:
+        stat_placeholder = st.empty()
+        result_placeholder = st.empty()
 
-        if not ret:
-            break
+    frame_count = 0
+    compliant_frames = 0
+    violation_frames = 0
 
-        results = model(frame)
+    with st.spinner("Running AI detection..."):
+        while cap.isOpened():
 
-        class_id = results[0].probs.top1
+            ret, frame = cap.read()
 
-        predicted_class = results[0].names[class_id]
+            if not ret:
+                break
 
-        confidence = float(
-            results[0].probs.top1conf
-        )
+            results = model(frame)
 
-        display_frame = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2RGB
-        )
+            class_id = results[0].probs.top1
+            predicted_class = results[0].names[class_id]
+            confidence = float(results[0].probs.top1conf)
 
-        frame_placeholder.image(
-            display_frame,
-            use_container_width=True
-        )
+            is_helmet = predicted_class.lower() == "helmet"
+            if is_helmet:
+                compliant_frames += 1
+            else:
+                violation_frames += 1
 
-        if predicted_class == "helmet":
+            frame_count += 1
 
-            prediction_placeholder.success(
-                f"✅ Helmet Detected ({confidence:.2%})"
+            if frame_count % LOG_EVERY_N_FRAMES == 0:
+                insert_detection("video", predicted_class, confidence)
+
+            display_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_placeholder.image(display_frame, use_container_width=True)
+
+            live_rate = (compliant_frames / frame_count * 100) if frame_count else 0
+            stat_placeholder.markdown(
+                f"""
+                <div class="kpi-card" style="margin-bottom:0.7rem;">
+                    <div class="kpi-label">Frames Processed</div>
+                    <div class="kpi-value" style="font-size:1.4rem;">{frame_count}</div>
+                </div>
+                <div class="kpi-card" style="margin-bottom:0.7rem;">
+                    <div class="kpi-label">Live Compliance Rate</div>
+                    <div class="kpi-value" style="font-size:1.4rem;">{live_rate:.1f}%</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Violations</div>
+                    <div class="kpi-value" style="font-size:1.4rem; color:#EF4444;">{violation_frames}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
 
-        else:
-
-            prediction_placeholder.error(
-                f"❌ No Helmet Detected ({confidence:.2%})"
-            )
+            with result_placeholder.container():
+                render_result_card(
+                    is_safe=is_helmet,
+                    title="Helmet Detected" if is_helmet else "No Helmet Detected",
+                    subtitle=f"Confidence: {confidence:.2%}",
+                )
 
     cap.release()
 
-    st.success("Video Processing Completed")
+    # Log a final aggregate row so a very short video (fewer than
+    # LOG_EVERY_N_FRAMES frames) still contributes at least one record.
+    if frame_count > 0 and frame_count < LOG_EVERY_N_FRAMES:
+        insert_detection("video", predicted_class, confidence)
+
+    st.success("Video processing completed")
